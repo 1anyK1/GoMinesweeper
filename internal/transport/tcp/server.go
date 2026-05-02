@@ -13,10 +13,15 @@ type Server struct {
 	logger  *slog.Logger
 }
 
-func NewServer(addr string, game *service.GameService, logger *slog.Logger) *Server {
+func NewServer(
+	addr string,
+	game *service.GameService,
+	sessions *service.SessionService,
+	logger *slog.Logger,
+) *Server {
 	return &Server{
 		addr:    addr,
-		handler: NewHandler(game, logger),
+		handler: NewHandler(game, sessions, logger),
 		logger:  logger,
 	}
 }

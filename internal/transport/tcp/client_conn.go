@@ -3,6 +3,7 @@ package tcp
 import "net"
 
 type ClientConn struct {
-	Name string
-	Conn net.Conn
+	Name      string
+	SessionID string
+	Conn      net.Conn
 }

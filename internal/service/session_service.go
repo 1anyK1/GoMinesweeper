@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 
 	"minesweeper/internal/domain"
@@ -23,7 +24,7 @@ func NewSessionService(repo *memory.SessionRepo, gameSize, mines int) *SessionSe
 
 func (s *SessionService) CreateSession(id string) (*domain.Session, error) {
 	if id == "" {
-		id = "default"
+		return nil, errors.New("session id is empty")
 	}
 
 	game, err := domain.NewGame(s.gameSize, s.mines)
@@ -40,19 +41,31 @@ func (s *SessionService) CreateSession(id string) (*domain.Session, error) {
 	return session, nil
 }
 
-func (s *SessionService) JoinSession(id, playerName string) error {
+func (s *SessionService) JoinSession(id, playerName string) (*domain.Session, error) {
 	session, err := s.repo.Get(id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	player := domain.NewPlayer(playerName)
 
 	if err := session.AddPlayer(player); err != nil {
-		return err
+		return nil, err
 	}
 
-	return s.repo.Save(session)
+	if err := s.repo.Save(session); err != nil {
+		return nil, err
+	}
+
+	return session, nil
+}
+
+func (s *SessionService) GetSession(id string) (*domain.Session, error) {
+	if id == "" {
+		return nil, errors.New("client has no active session")
+	}
+
+	return s.repo.Get(id)
 }
 
 func (s *SessionService) ListSessions() string {

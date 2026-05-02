@@ -13,17 +13,23 @@ import (
 )
 
 type Handler struct {
-	mu      sync.Mutex
-	clients map[string]*ClientConn
-	game    *service.GameService
-	logger  *slog.Logger
+	mu       sync.Mutex
+	clients  map[string]*ClientConn
+	game     *service.GameService
+	sessions *service.SessionService
+	logger   *slog.Logger
 }
 
-func NewHandler(game *service.GameService, logger *slog.Logger) *Handler {
+func NewHandler(
+	game *service.GameService,
+	sessions *service.SessionService,
+	logger *slog.Logger,
+) *Handler {
 	return &Handler{
-		clients: make(map[string]*ClientConn),
-		game:    game,
-		logger:  logger,
+		clients:  make(map[string]*ClientConn),
+		game:     game,
+		sessions: sessions,
+		logger:   logger,
 	}
 }
 
@@ -77,7 +83,13 @@ func (h *Handler) handleCommand(cmd Command, client *ClientConn) {
 		h.sendHelp(client.Conn)
 
 	case "create":
-		h.handleCreate(client)
+		h.handleCreate(cmd, client)
+
+	case "join":
+		h.handleJoin(cmd, client)
+
+	case "sessions":
+		h.handleSessions(client)
 
 	case "state":
 		h.handleState(client)
@@ -99,25 +111,40 @@ func (h *Handler) handleCommand(cmd Command, client *ClientConn) {
 	}
 }
 
-func (h *Handler) handleCreate(client *ClientConn) {
-	board, err := h.game.Create()
-	if err != nil {
-		_, _ = client.Conn.Write([]byte("failed to create game: " + err.Error() + "\n"))
+func (h *Handler) handleCreate(cmd Command, client *ClientConn) {
+	if len(cmd.Args) != 1 {
+		_, _ = client.Conn.Write([]byte("usage: create session_id\n"))
 		return
 	}
 
-	h.Broadcast("[GAME] new game created\n")
-	h.Broadcast(board)
+	sessionID := cmd.Args[0]
+
+	session, err := h.sessions.CreateSession(sessionID)
+	if err != nil {
+		_, _ = client.Conn.Write([]byte("failed to create session: " + err.Error() + "\n"))
+		return
+	}
+
+	session, err = h.sessions.JoinSession(session.ID, client.Name)
+	if err != nil {
+		_, _ = client.Conn.Write([]byte("failed to join session: " + err.Error() + "\n"))
+		return
+	}
+
+	client.SessionID = session.ID
+
+	_, _ = client.Conn.Write([]byte("created and joined session: " + session.ID + "\n"))
+	_, _ = client.Conn.Write([]byte(session.Game.Render()))
 }
 
 func (h *Handler) handleState(client *ClientConn) {
-	board, err := h.game.State()
+	session, err := h.sessions.GetSession(client.SessionID)
 	if err != nil {
-		_, _ = client.Conn.Write([]byte("error: " + err.Error() + ". type: create\n"))
+		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
 		return
 	}
 
-	_, _ = client.Conn.Write([]byte(board))
+	_, _ = client.Conn.Write([]byte(session.Game.Render()))
 }
 
 func (h *Handler) handleOpen(cmd Command, client *ClientConn) {
@@ -127,14 +154,20 @@ func (h *Handler) handleOpen(cmd Command, client *ClientConn) {
 		return
 	}
 
-	board, status, err := h.game.Open(x, y)
+	session, err := h.sessions.GetSession(client.SessionID)
 	if err != nil {
 		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
 		return
 	}
 
-	h.Broadcast(board)
-	h.broadcastStatus(status)
+	err = session.Game.Open(x, y)
+	if err != nil {
+		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
+		return
+	}
+
+	h.BroadcastToSession(session.ID, session.Game.Render())
+	h.broadcastStatusToSession(session.ID, session.Game.Status)
 }
 
 func (h *Handler) handleFlag(cmd Command, client *ClientConn) {
@@ -144,25 +177,33 @@ func (h *Handler) handleFlag(cmd Command, client *ClientConn) {
 		return
 	}
 
-	board, status, err := h.game.ToggleFlag(x, y)
+	session, err := h.sessions.GetSession(client.SessionID)
 	if err != nil {
 		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
 		return
 	}
 
-	h.Broadcast(board)
-	h.broadcastStatus(status)
+	err = session.Game.ToggleFlag(x, y)
+	if err != nil {
+		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
+		return
+	}
+
+	h.BroadcastToSession(session.ID, session.Game.Render())
+	h.broadcastStatusToSession(session.ID, session.Game.Status)
 }
 
 func (h *Handler) handleReset(client *ClientConn) {
-	board, err := h.game.Reset()
+	session, err := h.sessions.GetSession(client.SessionID)
 	if err != nil {
 		_, _ = client.Conn.Write([]byte("error: " + err.Error() + "\n"))
 		return
 	}
 
-	h.Broadcast("[GAME] reset\n")
-	h.Broadcast(board)
+	session.Game.Reset()
+
+	h.BroadcastToSession(session.ID, "[GAME] reset\n")
+	h.BroadcastToSession(session.ID, session.Game.Render())
 }
 
 func (h *Handler) handleList(client *ClientConn) {
@@ -177,25 +218,18 @@ func (h *Handler) handleList(client *ClientConn) {
 	_, _ = client.Conn.Write([]byte("players: " + strings.Join(names, ", ") + "\n"))
 }
 
-func (h *Handler) broadcastStatus(status domain.GameStatus) {
-	switch status {
-	case domain.StatusLose:
-		h.Broadcast("[GAME OVER] lose\n")
-	case domain.StatusWin:
-		h.Broadcast("[GAME OVER] win\n")
-	}
-}
-
 func (h *Handler) sendHelp(conn net.Conn) {
 	_, _ = conn.Write([]byte(
 		"Commands:\n" +
-			"  create        - create new game\n" +
-			"  state         - show board\n" +
-			"  open x y      - open cell\n" +
-			"  flag x y      - toggle flag\n" +
-			"  reset         - reset current game\n" +
-			"  list          - show connected players\n" +
-			"  help          - show help\n",
+			"  create session_id   - create and join session\n" +
+			"  join session_id     - join existing session\n" +
+			"  sessions            - list sessions\n" +
+			"  state               - show current session board\n" +
+			"  open x y            - open cell\n" +
+			"  flag x y            - toggle flag\n" +
+			"  reset               - reset current session\n" +
+			"  list                - show connected players\n" +
+			"  help                - show help\n",
 	))
 }
 
@@ -225,5 +259,55 @@ func (h *Handler) Broadcast(msg string) {
 
 	for _, client := range clients {
 		_, _ = client.Conn.Write([]byte(msg))
+	}
+}
+
+func (h *Handler) handleJoin(cmd Command, client *ClientConn) {
+	if len(cmd.Args) != 1 {
+		_, _ = client.Conn.Write([]byte("usage: join session_id\n"))
+		return
+	}
+
+	sessionID := cmd.Args[0]
+
+	session, err := h.sessions.JoinSession(sessionID, client.Name)
+	if err != nil {
+		_, _ = client.Conn.Write([]byte("failed to join session: " + err.Error() + "\n"))
+		return
+	}
+
+	client.SessionID = session.ID
+
+	_, _ = client.Conn.Write([]byte("joined session: " + sessionID + "\n"))
+	_, _ = client.Conn.Write([]byte(session.Game.Render()))
+}
+
+func (h *Handler) handleSessions(client *ClientConn) {
+	_, _ = client.Conn.Write([]byte(h.sessions.ListSessions()))
+}
+
+func (h *Handler) BroadcastToSession(sessionID string, msg string) {
+	h.mu.Lock()
+	clients := make([]*ClientConn, 0, len(h.clients))
+
+	for _, client := range h.clients {
+		if client.SessionID == sessionID {
+			clients = append(clients, client)
+		}
+	}
+
+	h.mu.Unlock()
+
+	for _, client := range clients {
+		_, _ = client.Conn.Write([]byte(msg))
+	}
+}
+
+func (h *Handler) broadcastStatusToSession(sessionID string, status domain.GameStatus) {
+	switch status {
+	case domain.StatusLose:
+		h.BroadcastToSession(sessionID, "[GAME OVER] lose\n")
+	case domain.StatusWin:
+		h.BroadcastToSession(sessionID, "[GAME OVER] win\n")
 	}
 }
